@@ -36,12 +36,16 @@
 #include "su.h"
 #include "utils.h"
 
+extern int is_daemon;
+extern int daemon_from_uid;
+extern int daemon_from_pid;
+
 unsigned get_shell_uid() {
   struct passwd* ppwd = getpwnam("shell");
   if (NULL == ppwd) {
     return 2000;
   }
-  
+
   return ppwd->pw_uid;
 }
 
@@ -50,7 +54,7 @@ unsigned get_system_uid() {
   if (NULL == ppwd) {
     return 1000;
   }
-  
+
   return ppwd->pw_uid;
 }
 
@@ -59,21 +63,36 @@ unsigned get_radio_uid() {
   if (NULL == ppwd) {
     return 1001;
   }
-  
+
   return ppwd->pw_uid;
+}
+
+int fork_zero_fucks() {
+    int pid = fork();
+    if (pid) {
+        int status;
+        waitpid(pid, &status, 0);
+        return pid;
+    }
+    else {
+        if (pid = fork())
+            exit(0);
+        return 0;
+    }
 }
 
 void exec_log(char *priority, char* logline) {
   int pid;
   if ((pid = fork()) == 0) {
-      int zero = open("/dev/zero", O_RDONLY | O_CLOEXEC);
-      dup2(zero, 0);
       int null = open("/dev/null", O_WRONLY | O_CLOEXEC);
-      dup2(null, 1);
-      dup2(null, 2);
-      execl("/system/bin/log", "/system/bin/log", "-p", priority, "-t", LOG_TAG, logline);
+      dup2(null, STDIN_FILENO);
+      dup2(null, STDOUT_FILENO);
+      dup2(null, STDERR_FILENO);
+      execl("/system/bin/log", "/system/bin/log", "-p", priority, "-t", LOG_TAG, logline, NULL);
       _exit(0);
   }
+  int status;
+  waitpid(pid, &status, 0);
 }
 
 void exec_loge(const char* fmt, ...) {
@@ -171,6 +190,11 @@ static int from_init(struct su_initiator *from) {
     pw = getpwuid(from->uid);
     if (pw && pw->pw_name) {
         strncpy(from->name, pw->pw_name, sizeof(from->name));
+    }
+
+    if (is_daemon) {
+        from->uid = daemon_from_uid;
+        from->pid = daemon_from_pid;
     }
 
     return 0;
@@ -361,7 +385,6 @@ static int socket_send_request(int fd, const struct su_context *ctx) {
 do {                                                \
     size_t __len = htonl(data_len);                 \
     __len = write((fd), &__len, sizeof(__len));     \
-    LOGE("%d", __len);\
     if (__len != sizeof(__len)) {                   \
         PLOGE("write(" #data ")");                  \
         return -1;                                  \
@@ -373,7 +396,7 @@ do {                                                \
     }                                               \
 } while (0)
 
-#define write_string(fd, name, data)        \
+#define write_string_data(fd, name, data)        \
 do {                                        \
     write_data(fd, name, strlen(name));     \
     write_data(fd, data, strlen(data));     \
@@ -384,26 +407,26 @@ do {                                        \
 do {                                        \
     char buf[16];                           \
     snprintf(buf, sizeof(buf), "%d", data); \
-    write_string(fd, name, buf);            \
+    write_string_data(fd, name, buf);            \
 } while (0)
 
     write_token(fd, "version", PROTO_VERSION);
     write_token(fd, "binary.version", VERSION_CODE);
     write_token(fd, "pid", ctx->from.pid);
-    write_string(fd, "from.name", ctx->from.name);
-    write_string(fd, "to.name", ctx->to.name);
+    write_string_data(fd, "from.name", ctx->from.name);
+    write_string_data(fd, "to.name", ctx->to.name);
     write_token(fd, "from.uid", ctx->from.uid);
     write_token(fd, "to.uid", ctx->to.uid);
-    write_string(fd, "from.bin", ctx->from.bin);
+    write_string_data(fd, "from.bin", ctx->from.bin);
     // TODO: Fix issue where not using -c does not result a in a command
-    write_string(fd, "command", get_command(&ctx->to));
+    write_string_data(fd, "command", get_command(&ctx->to));
     write_token(fd, "eof", PROTO_VERSION);
     return 0;
 }
 
 static int socket_receive_result(int fd, char *result, ssize_t result_len) {
     ssize_t len;
-    
+
     LOGD("waiting for user");
     len = read(fd, result, result_len-1);
     if (len < 0) {
@@ -421,6 +444,7 @@ static void usage(int status) {
     fprintf(stream,
     "Usage: su [options] [--] [-] [LOGIN] [--] [args...]\n\n"
     "Options:\n"
+    "  --daemon                      start the su daemon agent\n"
     "  -c, --command COMMAND         pass COMMAND to the invoked shell\n"
     "  -h, --help                    display this help message and exit\n"
     "  -, -l, --login                pretend the shell to be a login shell\n"
@@ -581,12 +605,34 @@ int access_disabled(const struct su_initiator *from) {
                  "enable it under settings -> developer options");
             return 1;
         }
-        
+
     }
     return 0;
 }
 
+static int is_api_18() {
+  char sdk_ver[PROPERTY_VALUE_MAX];
+  char *data = read_file("/system/build.prop");
+  get_property(data, sdk_ver, "ro.build.version.sdk", "0");
+  int ver = atoi(sdk_ver);
+  free(data);
+  return ver >= 18;
+}
+
 int main(int argc, char *argv[]) {
+    // start up in daemon mode if prompted
+    if (argc == 2 && strcmp(argv[1], "--daemon") == 0) {
+        return run_daemon();
+    }
+
+    // attempt to use the daemon client if not root,
+    // or this is api 18 and adb shell (/data is not readable even as root)
+    if ((geteuid() != AID_ROOT && getuid() != AID_ROOT) || (is_api_18() && getuid() == AID_SHELL)) {
+        // attempt to connect to daemon...
+        LOGD("starting daemon client %d %d", getuid(), geteuid());
+        return connect_daemon(argc, argv);
+    }
+
     // Sanitize all secure environment variables (from linker_environ.c in AOSP linker).
     /* The same list than GLibc at this point */
     static const char* const unsec_vars[] = {
@@ -755,7 +801,7 @@ int main(int argc, char *argv[]) {
     if (from_init(&ctx.from) < 0) {
         deny(&ctx);
     }
-        
+
     read_options(&ctx);
     user_init(&ctx);
 
@@ -837,7 +883,7 @@ int main(int argc, char *argv[]) {
             LOGD("db denied");
             deny(&ctx);        /* never returns too */
     }
-    
+
     socket_serv_fd = socket_create_temp(ctx.sock_path, sizeof(ctx.sock_path));
     LOGD(ctx.sock_path);
     if (socket_serv_fd < 0) {

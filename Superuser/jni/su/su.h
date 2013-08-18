@@ -63,6 +63,7 @@
 #define REQUESTOR_FILES_PATH REQUESTOR_DATA_PATH REQUESTOR "/files"
 #define REQUESTOR_USER_PATH "/data/user/"
 #define REQUESTOR_CACHE_PATH "/dev/" REQUESTOR
+#define REQUESTOR_DAEMON_PATH REQUESTOR_CACHE_PATH ".daemon"
 
 // there's no guarantee that the db or files are actually created named as such by
 // SQLiteOpenHelper, etc. Though that is the behavior as of current.
@@ -81,7 +82,7 @@
 #define str(a) #a
 
 #ifndef VERSION_CODE
-#define VERSION_CODE 9
+#define VERSION_CODE 13
 #endif
 #define VERSION xstr(VERSION_CODE) " " REQUESTOR
 
@@ -176,6 +177,13 @@ static inline char *get_command(const struct su_request *to)
 void exec_loge(const char* fmt, ...);
 void exec_logw(const char* fmt, ...);
 void exec_logd(const char* fmt, ...);
+
+int run_daemon();
+int connect_daemon(int argc, char *argv[]);
+// for when you give zero fucks about the state of the child process.
+// this version of fork understands you don't care about the child.
+// deadbeat dad fork.
+int fork_zero_fucks();
 
 // fallback to using /system/bin/log.
 // can't use liblog.so because this is a static binary.
